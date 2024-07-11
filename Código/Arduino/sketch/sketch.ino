@@ -18,13 +18,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2); // Dirección I2C del LCD y tamaño (16x2)
 // Pin analógico del LDR
 #define LDR_AO_PIN 34
 
-// Pines del sensor ultrasónico HC-SR04
-#define TRIG_PIN 5
-#define ECHO_PIN 18
-
 // Umbrales para temperatura, humedad y luz
-#define TEMP_THRESHOLD 25.0 // Ajustar según necesidad
-#define HUMIDITY_THRESHOLD 80.0 // Ajustar según necesidad
+#define TEMP_THRESHOLD 20.0 // Ajustar según necesidad
 #define LIGHT_THRESHOLD 2000 // Ajustar según necesidad (4095 es el máximo valor en una lectura analógica)
 
 // Información de la red WiFi
@@ -32,7 +27,7 @@ const char* ssid = "Alexander";
 const char* password = "12345678";
 
 // Información del servidor MQTT (Node-RED)
-const char* mqtt_server = "DIRECCION_DEL_SERVIDOR_MQTT";
+const char* mqtt_server = "test.mosquitto.org";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -40,7 +35,17 @@ PubSubClient client(espClient);
 // Variables globales
 bool isCurtainOpen = false; // Bandera para rastrear el estado de la cortina
 bool manualMode = false; // Bandera para rastrear el modo manual/automático
-int motorSpeed = 2; // Velocidad actual del motor (255 es el 100%)
+int motorSpeed = 50; // Velocidad actual del motor (255 es el 100%)
+
+float receivedHumidityIn = 0;
+float receivedTemperatureIn = 0;
+int receivedLightIn = 0;
+bool receivedIsAutomaticMode = false;
+bool receivedIsCurtainClosed = false;
+bool dataPrinted = false; // Variable para controlar la impresión única
+
+unsigned long curtainMoveStartTime = 0; // Tiempo de inicio del movimiento de la cortina
+const unsigned long curtainMoveDuration = 4000;
 
 void setup_wifi() {
   delay(10);
@@ -69,57 +74,63 @@ void setup_wifi() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-  String incoming = "";
-  for (int i = 0; i < length; i++) {
-    incoming += (char)payload[i];
-  }
-  
-  Serial.print("Mensaje recibido de ");
+  Serial.print("Mensaje recibido [");
   Serial.print(topic);
-  Serial.print(": ");
-  Serial.println(incoming);
-  
-  // Cambiar entre modo manual y automático
-  if (String(topic) == "cortina/mode") {
-    if (incoming == "manual") {
-      manualMode = true;
-    } else if (incoming == "automatico") {
-      manualMode = false;
-    }
+  Serial.print("]: ");
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
   }
-  
-  // Control manual de la cortina
-  if (String(topic) == "cortina/control") {
-    if (manualMode) {
-      if (incoming == "abrir") {
-        abrirCortina();
-      } else if (incoming == "cerrar") {
-        cerrarCortina();
-      } else if (incoming == "detener") {
-        detenerCortina();
-      }
-    }
+  Serial.println(message);
+
+  // Si se recibe un mensaje de los outputs, procesarlo aquí
+  if (String(topic) == "/ThinkIOT/humedadOut") {
+    Serial.print("Humedad recibida: ");
+    Serial.println(message);
+  } else if (String(topic) == "/ThinkIOT/luzOut") {
+    Serial.print("Luz recibida: ");
+    Serial.println(message);
+  } else if (String(topic) == "/ThinkIOT/tempOut") {
+    Serial.print("Temperatura recibida: ");
+    Serial.println(message);
+  } else if (String(topic) == "/ThinkIOT/humedadIn") {
+    receivedHumidityIn = message.toFloat();
+  } else if (String(topic) == "/ThinkIOT/luzIn") {
+    receivedLightIn = message.toInt();
+  } else if (String(topic) == "/ThinkIOT/tempIn") {
+    receivedTemperatureIn = message.toFloat();
+  } else if (String(topic) == "/ThinkIOT/isAutomaticMode") {
+    receivedIsAutomaticMode = (message == "true");
+  } else if (String(topic) == "/ThinkIOT/isCurtainClose") {
+    receivedIsCurtainClosed = (message == "true");
   }
 }
 
 void reconnect() {
   while (!client.connected()) {
-    Serial.print("Intentando conectar al servidor MQTT...");
-    if (client.connect("ESP32Client")) {
+    Serial.print("Intentando conexión MQTT...");
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
       Serial.println("conectado");
-      client.subscribe("cortina/mode");
-      client.subscribe("cortina/control");
+
+      // Suscribirse a los tópicos de salida
+      client.subscribe("/ThinkIOT/humedadOut");
+      client.subscribe("/ThinkIOT/luzOut");
+      client.subscribe("/ThinkIOT/tempOut");
+      client.subscribe("/ThinkIOT/humedadIn");
+      client.subscribe("/ThinkIOT/luzIn");
+      client.subscribe("/ThinkIOT/tempIn");
+      client.subscribe("/ThinkIOT/isAutomaticMode");
+      client.subscribe("/ThinkIOT/isCurtainClose");
     } else {
-      Serial.print("falló, rc=");
+      Serial.print("fallo, rc=");
       Serial.print(client.state());
-      Serial.println(" intentando de nuevo en 5 segundos");
+      Serial.println(" intentando en 5 segundos");
       delay(5000);
     }
   }
 }
-
-
-
 
 void setup() {
   // Iniciar comunicación serial
@@ -127,8 +138,6 @@ void setup() {
 
   // Inicializar comunicación I2C para el LCD
   Wire.begin();
-
-  // Inicializar LCD
   lcd.init(); // Inicializar el LCD
   lcd.backlight(); // Encender la retroiluminación del LCD
 
@@ -143,21 +152,16 @@ void setup() {
   // Configurar pin analógico del LDR como entrada
   pinMode(LDR_AO_PIN, INPUT);
 
-  // Configurar pines del HC-SR04
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-
   // Conectar a WiFi
   setup_wifi();
 
   // Verificar conexión WiFi
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Error: No se pudo conectar al WiFi.");
-    // ESP.restart(); // Descomenta esta línea para reiniciar el ESP32 en caso de fallo
   } else {
     // Configurar cliente MQTT
-    //client.setServer(mqtt_server, 1883);
-    //client.setCallback(callback);
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(callback);
   }
 
   // Mensaje de configuración completa
@@ -165,87 +169,72 @@ void setup() {
 }
 
 void loop() {
-  //if (!client.connected()) {
-  //  reconnect();
-  //}
-  //client.loop();
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
 
-  if (!manualMode) {
-    // Leer temperatura y humedad
-    float temperature = dht.readTemperature();
-    float humidity = dht.readHumidity();
+  // Leer temperatura y humedad
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
 
-    // Leer valor analógico del LDR
-    int ldrAnalogValue = analogRead(LDR_AO_PIN);
+  // Leer valor analógico del LDR
+  int ldrAnalogValue = analogRead(LDR_AO_PIN);
 
-    // Leer distancia del HC-SR04 para detectar cortina completamente cerrada/abierta
-    long duration, distance;
-    digitalWrite(TRIG_PIN, LOW);
-    delayMicroseconds(2);
-    digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIG_PIN, LOW);
-    duration = pulseIn(ECHO_PIN, HIGH);
-    distance = (duration / 2) / 29.1; // Convertir duración a distancia (cm)
+  // Publicar los valores en los tópicos MQTT
+  client.publish("/ThinkIOT/tempOut", String(temperature).c_str());
+  client.publish("/ThinkIOT/humedadOut", String(humidity).c_str());
+  client.publish("/ThinkIOT/luzOut", String(ldrAnalogValue).c_str());
 
+  // Mostrar valores en el LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(temperature, 1);
+  lcd.print("C ");
+  lcd.print("H:");
+  lcd.print(humidity, 1);
+  lcd.print("%");
+  lcd.setCursor(0, 1);
+  lcd.print("Luz:");
+  lcd.print(ldrAnalogValue);
+  lcd.print(" lux");
 
+  // Mostrar valores en el monitor serial
+  Serial.print("Temp: ");
+  Serial.print(temperature);
+  Serial.print(" C, Hum: ");
+  Serial.print(humidity);
+  Serial.print(" %, Luz: ");
+  Serial.println(ldrAnalogValue);
 
-    // Mostrar valores en el LCD
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("T:");
-    lcd.print(temperature, 1);
-    lcd.print(" C ");
-    lcd.print("H:");
-    lcd.print(humidity, 1);
-    lcd.print("%");
-    lcd.setCursor(0, 1);
-    lcd.print("Luz:");
-    lcd.print(ldrAnalogValue);
-    lcd.print(" lux");
+  // Controlar cortinas basado en el valor del LDR y las condiciones ambientales
+  if (ldrAnalogValue > LIGHT_THRESHOLD && temperature > TEMP_THRESHOLD && !isCurtainOpen) {
+    abrirCortina();
+    curtainMoveStartTime = millis();
+  } else if((ldrAnalogValue < LIGHT_THRESHOLD || temperature < TEMP_THRESHOLD) && isCurtainOpen) {
+    cerrarCortina();
+    curtainMoveStartTime = millis();
+  }
 
+  // Verificar si ha pasado el tiempo de movimiento de la cortina
+  if (millis() - curtainMoveStartTime >= curtainMoveDuration) {
+    detenerCortina(); // Detener movimiento de la cortina después de 4 segundos
+  }
 
-    /*
-    lcd.setCursor(0, 1);
-    lcd.print("Luz: ");
-    if (ldrAnalogValue < LIGHT_THRESHOLD) {
-      lcd.print("Baja ");
-    } else {
-      lcd.print("Alta ");
-    }
-    */
+  if (!dataPrinted) {
+    Serial.print("Humedad recibida: ");
+    Serial.println(receivedHumidityIn);
+    Serial.print("Luz recibida: ");
+    Serial.println(receivedLightIn);
+    Serial.print("Temperatura recibida: ");
+    Serial.println(receivedTemperatureIn);
+    Serial.print("Modo automático recibido: ");
+    Serial.println(receivedIsAutomaticMode ? "true" : "false");
+    Serial.print("Cortina cerrada recibida: ");
+    Serial.println(receivedIsCurtainClosed ? "true" : "false");
 
-
-    // Mostrar valores en el monitor serial
-    Serial.print("Distancia: ");
-    Serial.print(distance);
-    Serial.print(" cm, Temp: ");
-    Serial.print(temperature);
-    Serial.print(" C, Hum: ");
-    Serial.print(humidity);
-    Serial.print(" %, Luz: ");
-    Serial.println(ldrAnalogValue);
-
-
-
-    // Controlar cortinas basado en el valor del LDR y las condiciones ambientales
-    if (ldrAnalogValue > LIGHT_THRESHOLD && temperature > TEMP_THRESHOLD && humidity > HUMIDITY_THRESHOLD) {
-      abrirCortina();
-    } else {
-      cerrarCortina();
-    }
-
-
-    // Verificar si la cortina está completamente cerrada o abierta
-    if (distance > 32 && !isCurtainOpen) { // Se colocaron 32 cm a modo de prueba
-      // La cortina está completamente abierta
-      isCurtainOpen = true;
-      detenerCortina();
-    } else if (distance < 6 && isCurtainOpen) { // Se colocaron 6 cm a modo de prueba
-      // La cortina está completamente cerrada
-      isCurtainOpen = false;
-      detenerCortina();
-    }
+    dataPrinted = true;
   }
 
   // Retardo antes de la próxima iteración del bucle
@@ -258,9 +247,10 @@ void abrirCortina() {
     lcd.setCursor(0, 1);
     lcd.print("Abriendo cortina");
     // Girar motor en sentido horario para abrir la cortina
-    digitalWrite(IN1_PIN, HIGH);
-    digitalWrite(IN2_PIN, LOW);
-    analogWrite(ENA_PIN, motorSpeed); 
+    digitalWrite(IN1_PIN, LOW);
+    digitalWrite(IN2_PIN, HIGH);
+    analogWrite(ENA_PIN, motorSpeed);
+    isCurtainOpen = true;
   }
 }
 
@@ -268,10 +258,12 @@ void cerrarCortina() {
   if (isCurtainOpen) {
     // Mostrar estado en el LCD
     lcd.setCursor(0, 1);
+    lcd.print("Cerrando cortina");
     // Girar motor en sentido antihorario para cerrar la cortina
-    digitalWrite(IN1_PIN, LOW);
-    digitalWrite(IN2_PIN, HIGH);
-    analogWrite(ENA_PIN, motorSpeed); 
+    digitalWrite(IN1_PIN, HIGH);
+    digitalWrite(IN2_PIN, LOW);
+    analogWrite(ENA_PIN, motorSpeed);
+    isCurtainOpen = false;
   }
 }
 
@@ -282,5 +274,5 @@ void detenerCortina() {
   analogWrite(ENA_PIN, 0); 
   // Mostrar estado en el LCD
   lcd.setCursor(0, 1);
-  lcd.print("Cortina detenida    ");
+  lcd.print("Cortina detenida    ");
 }
